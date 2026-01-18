@@ -18,10 +18,26 @@ import requests
 import ssl
 import urllib3
 from typing import Dict, Optional
+import random
+
+import math
 
 # Suppress SSL warnings for self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+def round_to_100 (num) :
+    return math.floor(num / 100) * 100
+
+def BUY(qty, price):
+    print(f"SEND: BUY {qty} @ {price}")
+    return {"side": "BUY", "price": price, "qty": qty}
+
+def SELL(qty, price):
+    print(f"SEND: SELL {qty} @ {price}")
+    return {"side": "SELL", "price": price, "qty": qty}
+
+
+MAX_INVENTORY = 2000
 
 class TradingBot:
     """
@@ -44,29 +60,181 @@ class TradingBot:
         # Session info (set after registration)
         self.token = None
         self.run_id = None
+
+        # WebSocket connections
+        self.market_ws = None
+        self.order_ws = None
+        self.running = True
         
         # Trading state - track your position
         self.inventory = 0      # Current position (positive = long, negative = short)
         self.cash_flow = 0.0    # Cumulative cash from trades (negative when buying)
         self.pnl = 0.0          # Mark-to-market PnL (cash_flow + inventory * mid_price)
+        self.past_pnl = 0.0
         self.current_step = 0   # Current simulation step
         self.orders_sent = 0    # Number of orders sent
+        self.open_order = {}
+        self.active_orders = {}
         
         # Market data
         self.last_bid = 0.0
         self.last_ask = 0.0
         self.last_mid = 0.0
         
-        # WebSocket connections
-        self.market_ws = None
-        self.order_ws = None
-        self.running = True
-        
         # Latency measurement
         self.last_done_time = None          # When we sent DONE
         self.step_latencies = []            # Time between DONE and next market data
         self.order_send_times = {}          # order_id -> time sent
         self.fill_latencies = []            # Time between order and fill
+
+        self.pending_buys = 0
+        self.pending_asks = 0
+        self.prev_inventory = self.inventory
+
+        self.last_bids = [0]
+        self.last_asks = [0]
+
+        self.current_bids = [0]
+        self.current_asks = [0]
+
+        self.micro_flip_count = 0
+        self.last_mid_dir = 0
+        self.hft_pause = 0
+
+    def CANCEL(self):
+        try:
+            for id in self.active_orders:
+                self.order_ws.send(json.dumps({'Action': 'CANCEL', 'order_id': id}))
+                del self.active_orders[id]
+        except:
+            pass
+    # =========================================================================
+    # YOUR STRATEGY - MODIFY THIS METHOD!
+    # =========================================================================
+    
+    def cancel_far_orders(self, mid, max_dist=0.3):
+        for oid, o in list(self.active_orders.items()):
+            if abs(o["price"] - mid) > max_dist:
+                try:
+                    self.order_ws.send(json.dumps({
+                        "action": "CANCEL",
+                        "order_id": oid
+                    }))
+                except:
+                    pass
+                self.active_orders.pop(oid, None)
+
+    def decide_order(self, bid: float, ask: float, mid: float) -> Optional[Dict]:
+        """
+        ╔══════════════════════════════════════════════════════════════════╗
+        ║                    YOUR STRATEGY GOES HERE!                       ║
+        ╠══════════════════════════════════════════════════════════════════╣
+        ║  Input:                                                           ║
+        ║    - bid: Best bid price                                          ║
+        ║    - ask: Best ask price                                          ║
+        ║    - mid: Mid price (average of bid and ask)                      ║
+        ║                                                                   ║
+        ║  Available state:                                                 ║
+        ║    - self.inventory: Your current position                         ║
+        ║    - self.pnl: Your realized PnL                                  ║
+        ║    - self.current_step: Current simulation step                   ║
+        ║                                                                   ║
+        ║  Return:                                                          ║
+        ║    - {"side": "BUY"|"SELL", "price": X, "qty": N}                 ║
+        ║    - Or return None to not send an order                          ║
+        ╚══════════════════════════════════════════════════════════════════╝
+        """
+
+        if self.current_step < 3:
+            prev_pnl = self.pnl
+            return None
+
+        if len(self.open_order) >= 20:
+            return None
+        
+        delta = mid - self.last_mid
+        self.last_mid = mid
+
+        direction = 1 if delta > 0 else -1 if delta < 0 else 0
+        if direction != 0 and direction != self.last_mid_dir:
+            self.micro_flip_count += 1
+        self.last_mid_dir = direction
+
+        self.micro_flip_count = max(0, self.micro_flip_count - 0.5)
+
+        if self.micro_flip_count > 6 and (ask - bid) < 0.3:
+            self.hft_pause = 10
+
+        if self.hft_pause > 0:
+            self.hft_pause -= 1
+            self.cancel_far_orders(mid)
+            return None
+        
+        inventory_change = self.inventory - self.prev_inventory
+        if inventory_change < 0:
+            self.pending_asks -= abs(inventory_change)
+        elif inventory_change > 0:
+            self.pending_buys -= abs(inventory_change)
+        self.prev_inventory = self.inventory
+
+        # DOES NOT INCLUDE CURRENT BID AND ASK
+        average_bid = sum(self.last_bids) / 3
+        average_ask = sum(self.last_asks) / 3
+
+        self.last_bids.append(bid)
+        if len(self.last_bids) > 3:
+            self.last_bids.pop(0)
+
+        self.last_asks.append(ask)
+        if len(self.last_asks) > 3:
+            self.last_asks.pop(0)
+
+        qty_at_bid = self.current_bids[0]["qty"] if len(self.current_bids) > 0 else 0
+        qty_at_ask = self.current_asks[0]["qty"] if len(self.current_asks) > 0 else 0
+
+        if self.current_step % 100 == 0:
+            print(f"Bid_avg: {average_bid}; Ask_avg: {average_ask}; PnL: {self.pnl}; Pending BUY: {self.pending_buys} ASK: {self.pending_asks}")
+
+        if bid > average_bid:
+            qty = round_to_100(
+                min(
+                    max(self.inventory + MAX_INVENTORY - self.pending_asks, 0),
+                    qty_at_bid,
+                    abs(bid - average_bid) * 50
+                )
+            )
+            if qty > 0:
+                self.pending_asks += qty
+                return SELL(qty, bid - 0.1)
+            else:
+                return self.CANCEL()
+        
+        if ask < average_ask:
+            qty = round_to_100(
+                min(
+                    max(MAX_INVENTORY - self.inventory - self.pending_buys, 0),
+                    qty_at_ask,
+                    abs(ask - average_ask) * 50
+                )
+            )
+            if qty > 0:
+                self.pending_buys += qty
+                return BUY(qty, ask + 0.1)
+            else:
+                return self.CANCEL()
+        
+        qty = 100
+        if self.current_step % 2 == 0:
+            self.past_pnl = self.pnl
+        if self.pnl != self.past_pnl:
+            if self.inventory > 0:
+                return SELL(qty, bid - 0.1)
+            elif self.inventory < 0:
+                return BUY(qty, ask + 0.1)
+            else:
+                return SELL(qty, ask)
+        
+        return None
     
     # =========================================================================
     # REGISTRATION - Get a token to start trading
@@ -178,6 +346,9 @@ class TradingBot:
             self.current_step = data.get("step", 0)
             self.last_bid = data.get("bid", 0.0)
             self.last_ask = data.get("ask", 0.0)
+
+            self.current_bids = data.get("bids", [])
+            self.current_asks = data.get("asks", [])
             
             # Log progress every 500 steps with latency stats
             if self.current_step % 500 == 0 and self.step_latencies:
@@ -209,62 +380,6 @@ class TradingBot:
             print(f"[{self.student_id}] Market data error: {e}")
     
     # =========================================================================
-    # YOUR STRATEGY - MODIFY THIS METHOD!
-    # =========================================================================
-    
-    def decide_order(self, bid: float, ask: float, mid: float) -> Optional[Dict]:
-        """
-        ╔══════════════════════════════════════════════════════════════════╗
-        ║                    YOUR STRATEGY GOES HERE!                       ║
-        ╠══════════════════════════════════════════════════════════════════╣
-        ║  Input:                                                           ║
-        ║    - bid: Best bid price                                          ║
-        ║    - ask: Best ask price                                          ║
-        ║    - mid: Mid price (average of bid and ask)                      ║
-        ║                                                                   ║
-        ║  Available state:                                                 ║
-        ║    - self.inventory: Your current position                         ║
-        ║    - self.pnl: Your realized PnL                                  ║
-        ║    - self.current_step: Current simulation step                   ║
-        ║                                                                   ║
-        ║  Return:                                                          ║
-        ║    - {"side": "BUY"|"SELL", "price": X, "qty": N}                 ║
-        ║    - Or return None to not send an order                          ║
-        ╚══════════════════════════════════════════════════════════════════╝
-        """
-        
-        # Skip if no valid prices
-        if mid <= 0 or bid <= 0 or ask <= 0:
-            return None
-        
-        # =================================================================
-        # EXAMPLE STRATEGY: Conservative trading
-        # 
-        # - Cross the spread aggressively to get fills
-        # - Manage inventory by alternating buy/sell
-        # =================================================================
-        
-        # Only trade every 50 steps to avoid hitting order limits
-        if self.current_step % 50 != 0:
-            return None
-        
-        # If we're too long, sell aggressively (hit the bid)
-        if self.inventory > 200:
-            return {"side": "SELL", "price": round(bid, 2), "qty": 100}
-        
-        # If we're too short, buy aggressively (lift the offer)
-        elif self.inventory < -200:
-            return {"side": "BUY", "price": round(ask, 2), "qty": 100}
-        
-        # Otherwise, alternate buy/sell to demonstrate trading
-        elif (self.current_step // 50) % 2 == 0:
-            # Buy aggressively (cross the spread)
-            return {"side": "BUY", "price": round(ask, 2), "qty": 100}
-        else:
-            # Sell aggressively (cross the spread)
-            return {"side": "SELL", "price": round(bid, 2), "qty": 100}
-    
-    # =========================================================================
     # ORDER HANDLING
     # =========================================================================
     
@@ -283,6 +398,10 @@ class TradingBot:
             self.order_send_times[order_id] = time.time()  # Track send time
             self.order_ws.send(json.dumps(msg))
             self.orders_sent += 1
+            if order_id in self.open_order:
+                self.open_order[order_id] += order['qty']
+            else:
+                self.open_order[order_id] = order['qty']
         except Exception as e:
             print(f"[{self.student_id}] Send order error: {e}")
     
@@ -294,6 +413,23 @@ class TradingBot:
         except:
             pass
     
+    def create_order(self, side, price, qty):
+        # Create unique order_id based on order attributes
+        order_id = f"ORD_{random.randint(1000, 9999)}"
+        
+        # Send the order to the order_ws (order entry WebSocket)
+        self.order_ws.send(json.dumps({
+            "order_id": order_id,
+            "side": side,
+            "price": price,
+            "qty": qty
+        }))
+        
+        # Add the order to active orders
+        self.active_orders[order_id] = {"side": side, "price": price, "qty": qty}
+        return order_id
+
+
     def _on_order_response(self, ws, message: str):
         """Handle order responses and fills."""
         try:
@@ -309,6 +445,10 @@ class TradingBot:
                 price = data.get("price", 0)
                 side = data.get("side", "")
                 order_id = data.get("order_id", "")
+                self.open_order[order_id] -= qty
+                if self.open_order[order_id] <= 0:
+                    del self.open_order[order_id]
+
                 
                 # Measure fill latency
                 if order_id in self.order_send_times:
