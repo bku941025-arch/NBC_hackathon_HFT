@@ -2,6 +2,9 @@
 
 A Python template for building trading algorithms that connect to the exchange simulator.
 
+## Video Display Below
+https://youtu.be/EnJurCD0liQ
+
 ## Quick Start
 Available scenarios
 - normal_market
